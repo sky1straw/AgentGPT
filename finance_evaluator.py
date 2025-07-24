@@ -4,18 +4,25 @@ from tkinter import ttk
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import os
+import mysql.connector
+
+DB_CONFIG = {"host": "localhost", "user": os.getenv("MYSQL_USER", "root"), "password": os.getenv("MYSQL_PASSWORD", ""), "database": os.getenv("MYSQL_DB", "finance_evaluator")}
+
 @dataclass
 class CashFlow:
     amount: float
     party: str
     date: str
 
+    id: int | None = None
     def __str__(self):
         return f"{self.date} | {self.party} | {self.amount}"
 
 @dataclass
 class Project:
     name: str
+    project_id: int | None = None
     inflows: list[CashFlow] = field(default_factory=list)
     outflows: list[CashFlow] = field(default_factory=list)
 
@@ -36,8 +43,52 @@ class FinanceApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Finance Project Evaluator")
-        self.projects: list[Project] = []
+        self.conn = mysql.connector.connect(
+            host=DB_CONFIG["host"],
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+        )
+        self.init_db()
+        self.projects: list[Project] = self.load_projects()
         self.create_widgets()
+
+    def init_db(self):
+        cur = self.conn.cursor()
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}")
+        self.conn.database = DB_CONFIG["database"]
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS projects (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) UNIQUE
+        )"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS inflows (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            project_id INT,
+            amount DOUBLE,
+            party VARCHAR(255),
+            date VARCHAR(20)
+        )"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS outflows (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            project_id INT,
+            amount DOUBLE,
+            party VARCHAR(255),
+            date VARCHAR(20)
+        )"""
+        )
+        self.conn.commit()
+        cur.close()
+
+    def load_projects(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, name FROM projects")
+        projects = [Project(name=name, project_id=pid) for pid, name in cur.fetchall()]
+        cur.close()
+        return projects
 
     def create_widgets(self):
         self.project_list = tk.Listbox(self, height=6)
@@ -47,11 +98,17 @@ class FinanceApp(tk.Tk):
         btn_frame.pack(pady=5)
         tk.Button(btn_frame, text="Add Project", command=self.add_project).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Open Project", command=self.open_project).pack(side=tk.LEFT, padx=5)
+        self.refresh_projects()
 
     def add_project(self):
         name = simpledialog.askstring("Project Name", "Enter project name:")
         if name:
-            self.projects.append(Project(name=name))
+            cur = self.conn.cursor()
+            cur.execute("INSERT INTO projects (name) VALUES (%s)", (name,))
+            self.conn.commit()
+            pid = cur.lastrowid
+            cur.close()
+            self.projects.append(Project(name=name, project_id=pid))
             self.refresh_projects()
 
     def open_project(self):
@@ -73,7 +130,26 @@ class ProjectWindow(tk.Toplevel):
         super().__init__(master)
         self.project = project
         self.title(project.name)
+        self.load_flows()
         self.create_widgets()
+
+    def load_flows(self):
+        cur = self.master.conn.cursor()
+        cur.execute(
+            "SELECT id, amount, party, date FROM inflows WHERE project_id=%s",
+            (self.project.project_id,),
+        )
+        self.project.inflows = [
+            CashFlow(amount=a, party=p, date=d, id=i) for i, a, p, d in cur.fetchall()
+        ]
+        cur.execute(
+            "SELECT id, amount, party, date FROM outflows WHERE project_id=%s",
+            (self.project.project_id,),
+        )
+        self.project.outflows = [
+            CashFlow(amount=a, party=p, date=d, id=i) for i, a, p, d in cur.fetchall()
+        ]
+        cur.close()
 
     def create_widgets(self):
         tk.Label(self, text=f"Project: {self.project.name}").pack()
@@ -95,12 +171,12 @@ class ProjectWindow(tk.Toplevel):
         self.refresh_lists()
 
     def add_inflow(self):
-        self.add_flow(self.project.inflows, "Inflow Source")
+        self.add_flow(self.project.inflows, "Inflow Source", "inflows")
 
     def add_outflow(self):
-        self.add_flow(self.project.outflows, "Outflow Destination")
+        self.add_flow(self.project.outflows, "Outflow Destination", "outflows")
 
-    def add_flow(self, flow_list, prompt):
+    def add_flow(self, flow_list, prompt, table):
         party = simpledialog.askstring(prompt, f"Enter {prompt.lower()}:")
         amount_str = simpledialog.askstring("Amount", "Enter amount:")
         date_str = simpledialog.askstring("Date", "Enter date (YYYY-MM-DD):", initialvalue=datetime.today().strftime("%Y-%m-%d"))
@@ -111,7 +187,15 @@ class ProjectWindow(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Error", "Invalid amount")
             return
-        flow_list.append(CashFlow(amount=amount, party=party, date=date_str))
+        cur = self.master.conn.cursor()
+        cur.execute(
+            f"INSERT INTO {table} (project_id, amount, party, date) VALUES (%s, %s, %s, %s)",
+            (self.project.project_id, amount, party, date_str),
+        )
+        self.master.conn.commit()
+        flow_id = cur.lastrowid
+        cur.close()
+        flow_list.append(CashFlow(amount=amount, party=party, date=date_str, id=flow_id))
         self.refresh_lists()
 
     def refresh_lists(self):
